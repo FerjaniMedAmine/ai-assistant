@@ -1,0 +1,6 @@
+The Gemini 3.8 Flash model is an advanced multimodal reasoning model designed for high-speed, intelligent assistance with configurable thinking levels.
+It allows users to allocate thinking budgets (low, medium, high) to trade off between latency and depth of chain-of-thought deliberation.
+
+Qdrant is a specialized vector similarity search engine. It natively supports hybrid search, combining dense vectors with sparse inverted indexes using Reciprocal Rank Fusion (RRF).
+BGE-M3 is a state-of-the-art multilingual embedding model developed by BAAI that simultaneously generates dense embeddings, sparse lexical representations, and multi-vector ColBERT representations.
+BGE-Reranker-v2-M3 performs cross-encoder scoring to re-order top retrieval candidates for maximum contextual precision.
