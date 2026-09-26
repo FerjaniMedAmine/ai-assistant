@@ -4,21 +4,24 @@ export default function KnowledgeModal({
   isOpen,
   onClose,
   stats,
+  documents = [],
   onIngest,
   onClearAll,
+  onDeleteDocument,
 }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [rawText, setRawText] = useState('');
   const [sourceName, setSourceName] = useState('');
   const [ingesting, setIngesting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('');
+  const [filter, setFilter] = useState('');
 
   if (!isOpen) return null;
 
   const handleIngestFile = async () => {
     if (!selectedFile) return;
     setIngesting(true);
-    setStatusMsg('Chunking and embedding document with BGE-M3 (dense + sparse)...');
+    setStatusMsg('Indexing document with Gemini embeddings and Qdrant BM25...');
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -37,7 +40,7 @@ export default function KnowledgeModal({
   const handleIngestText = async () => {
     if (!rawText.trim()) return;
     setIngesting(true);
-    setStatusMsg('Chunking and embedding text with BGE-M3...');
+    setStatusMsg('Indexing text with Gemini embeddings and Qdrant BM25...');
 
     const formData = new FormData();
     formData.append('text', rawText.trim());
@@ -59,7 +62,7 @@ export default function KnowledgeModal({
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-content" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <div className="modal-title">📚 RAG Knowledge Base (Qdrant & BGE-M3)</div>
+          <div className="modal-title">Knowledge Base</div>
           <button className="modal-close-btn" onClick={onClose}>✕</button>
         </div>
 
@@ -80,6 +83,26 @@ export default function KnowledgeModal({
               {statusMsg}
             </div>
           )}
+
+          <div className="knowledge-help">Documents are indexed whenever you add them. The RAG switch controls retrieval for chat replies only.</div>
+
+          <div className="knowledge-list-header">
+            <strong>Indexed sources ({documents.length})</strong>
+            <input className="input-text" aria-label="Filter sources" placeholder="Filter sources" value={filter} onChange={(event) => setFilter(event.target.value)} />
+          </div>
+          <div className="knowledge-list">
+            {documents.filter((doc) => doc.source.toLowerCase().includes(filter.toLowerCase())).map((doc) => (
+              <div className="knowledge-row" key={doc.source}>
+                <div><strong>{doc.source}</strong><small>{doc.chunks} chunks</small></div>
+                <button className="btn-sm-secondary" onClick={async () => {
+                  if (!window.confirm(`Remove ${doc.source} from your knowledge base?`)) return;
+                  try { await onDeleteDocument(doc.source); setStatusMsg(`Removed ${doc.source}.`); }
+                  catch (error) { setStatusMsg(`Could not remove source: ${error.message}`); }
+                }}>Remove</button>
+              </div>
+            ))}
+            {documents.length === 0 && <p className="knowledge-empty">No documents indexed yet.</p>}
+          </div>
 
           {/* Upload File */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -136,15 +159,15 @@ export default function KnowledgeModal({
             className="btn-msg-action"
             style={{ color: '#ff6666', borderColor: '#552222', padding: '6px 12px', fontSize: '11px' }}
             onClick={async () => {
-              if (window.confirm('Are you sure you want to permanently purge all documents and vector points from Qdrant?')) {
+              if (window.confirm('Remove all of your indexed documents?')) {
                 if (onClearAll) {
                   await onClearAll();
-                  setStatusMsg('All vector points have been purged from Qdrant.');
+                  setStatusMsg('All your indexed documents were removed.');
                 }
               }
             }}
           >
-            🗑️ Clear All Knowledge
+            Clear My Knowledge
           </button>
           <button className="btn-sm-secondary" onClick={onClose}>
             Close

@@ -2,7 +2,9 @@ import os
 import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from backend.models import User
+from backend.routers.auth import get_current_user
 from backend.rag.ingestion import ingest_text, ingest_file
 from backend.rag.vector_store import QdrantVectorStore
 from backend.schemas import IngestResponse, DocumentInfo
@@ -15,7 +17,7 @@ async def ingest_document(
     file: UploadFile = File(None),
     text: str = Form(None),
     source_name: str = Form(None),
-    user_id: str = Form("default_user")
+    user: User = Depends(get_current_user),
 ):
     """
     Ingest a document file (.txt, .md, .pdf) or raw text snippet into Qdrant Cloud
@@ -29,7 +31,7 @@ async def ingest_document(
             tmp_path = Path(tmp.name)
 
         try:
-            count = ingest_file(tmp_path, user_id=user_id)
+            count = ingest_file(tmp_path, user_id=user.id, source_name=Path(file.filename).name)
             doc_name = file.filename
         finally:
             if tmp_path.exists():
@@ -44,7 +46,7 @@ async def ingest_document(
 
     elif text and text.strip():
         name = source_name or "text_snippet"
-        count = ingest_text(text, source_name=name, user_id=user_id)
+        count = ingest_text(text, source_name=name, user_id=user.id)
         return IngestResponse(
             status="success",
             chunks_indexed=count,
@@ -59,12 +61,12 @@ async def ingest_document(
         )
 
 @router.get("", response_model=DocumentInfo)
-def get_documents_info():
+def get_documents_info(user: User = Depends(get_current_user)):
     """
     Returns current index statistics from Qdrant.
     """
     store = QdrantVectorStore.get_instance()
-    stats = store.get_stats()
+    stats = store.get_stats(user.id)
     return DocumentInfo(
         total_points=stats.get("total_points", 0),
         collection_name=stats.get("collection_name", config.QDRANT_COLLECTION_NAME),
@@ -72,10 +74,21 @@ def get_documents_info():
     )
 
 @router.delete("", status_code=200)
-def clear_all_documents():
+def clear_all_documents(user: User = Depends(get_current_user)):
     """
     Purges all documents and indexed points from Qdrant.
     """
     store = QdrantVectorStore.get_instance()
-    store.clear_all()
-    return {"status": "success", "message": "All documents and vector points in Qdrant have been purged."}
+    store.clear_all(user.id)
+    return {"status": "success", "message": "Your documents have been removed."}
+
+
+@router.get("/list")
+def list_documents(user: User = Depends(get_current_user)):
+    return QdrantVectorStore.get_instance().list_documents(user.id)
+
+
+@router.delete("/source")
+def delete_document(source: str, user: User = Depends(get_current_user)):
+    QdrantVectorStore.get_instance().delete_document(user.id, source)
+    return {"status": "success"}

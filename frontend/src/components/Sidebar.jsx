@@ -13,6 +13,9 @@ export default function Sidebar({
   onOpenKnowledgeModal,
   memoryCount = 0,
   ragPointsCount = 0,
+  documentCount = 0,
+  user,
+  onSignOut,
 }) {
   const currentMode = activeConv?.mode || 'linear';
   const isCurrentEmpty = messagesCount === 0;
@@ -75,6 +78,7 @@ export default function Sidebar({
       </div>
 
       <div className="sidebar-conversations">
+        <div className="sidebar-section-label">CONVERSATIONS</div>
         {conversations.length === 0 ? (
           <div style={{ padding: '20px 12px', fontSize: '12px', color: '#555', textAlign: 'center' }}>
             No conversations yet. Start a new chat above.
@@ -115,19 +119,25 @@ export default function Sidebar({
       </div>
 
       <div className="sidebar-footer">
+        <div className="sidebar-section-label">WORKSPACE</div>
         <button className="sidebar-footer-btn" onClick={onOpenMemoryModal}>
-          <span>🧠 Persistent Memory</span>
+          <span>Persistent Memory</span>
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
             {memoryCount} facts
           </span>
         </button>
 
         <button className="sidebar-footer-btn" onClick={onOpenKnowledgeModal}>
-          <span>📚 RAG Knowledge Base</span>
+          <span>Knowledge Base</span>
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
-            {ragPointsCount} chunks
+            {documentCount} docs · {ragPointsCount} chunks
           </span>
         </button>
+        <div className="sidebar-profile">
+          {user?.picture ? <img src={user.picture} alt="" referrerPolicy="no-referrer" /> : <span className="sidebar-avatar">{user?.name?.[0] || 'U'}</span>}
+          <div className="sidebar-profile-info"><strong>{user?.name}</strong><small>{user?.email}</small></div>
+          <button className="sidebar-signout" onClick={onSignOut} title="Sign out">Sign out</button>
+        </div>
       </div>
     </aside>
   );

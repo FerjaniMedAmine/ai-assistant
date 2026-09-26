@@ -17,9 +17,22 @@ apiClient.interceptors.response.use(
       error.response?.data?.detail ||
       error.message ||
       'An unexpected error occurred communicating with the server.';
-    return Promise.reject(new Error(message));
+    const result = new Error(message);
+    result.status = error.response?.status;
+    return Promise.reject(result);
   }
 );
+
+export const getCurrentUser = async () => {
+  try {
+    return (await apiClient.get('/auth/me')).data;
+  } catch (error) {
+    if (error.status === 401) return null;
+    throw error;
+  }
+};
+
+export const signOut = async () => apiClient.post('/auth/logout');
 
 // Conversations API
 export const getConversations = async () => {
@@ -164,6 +177,11 @@ export const clearDocuments = async () => {
   const response = await apiClient.delete('/documents');
   return response.data;
 };
+
+export const listDocuments = async () => (await apiClient.get('/documents/list')).data;
+
+export const deleteDocumentSource = async (source) =>
+  apiClient.delete('/documents/source', { params: { source } });
 
 // Config API
 export const getRuntimeConfig = async () => {

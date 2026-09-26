@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.config import config
 from backend.database import SessionLocal, init_db
-from backend.models import Conversation, Message, Memory
+from backend.models import Conversation, Message, Memory, User
 from backend.agent.tools import build_agent_tools
 from backend.rag.retrieval import retrieve_and_rerank
 from backend.rag.vector_store import QdrantVectorStore
@@ -177,7 +177,11 @@ def test_editing_message_hard_deletes_subsequent():
 def test_agent_tools():
     db: Session = SessionLocal()
     try:
-        conv = Conversation(title="Test Tools Conv", mode="linear")
+        user = User(google_sub="test-agent-tools", email="test@example.com", name="Test User")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        conv = Conversation(title="Test Tools Conv", mode="linear", user_id=user.id)
         db.add(conv)
         db.commit()
         db.refresh(conv)
@@ -187,7 +191,7 @@ def test_agent_tools():
         db.commit()
 
         tool_events = []
-        tools = build_agent_tools(db, conv.id, tool_events)
+        tools = build_agent_tools(db, conv.id, tool_events, user.id)
         tools_dict = {t.name: t for t in tools}
 
         # Test add_to_memory
@@ -212,13 +216,14 @@ def test_agent_tools():
 
         # Clean up
         db.delete(conv)
+        db.delete(user)
         db.commit()
     finally:
         db.close()
 
 def test_qdrant_hybrid_search():
     # Verify hybrid retrieval returns candidates and reranks
-    results = retrieve_and_rerank("Gemini model thinking", top_k=5, top_n=2)
+    results = retrieve_and_rerank("Gemini model thinking", top_k=5, top_n=2, user_id="default_user")
     assert isinstance(results, list)
     if results:
         assert "content" in results[0]
@@ -242,4 +247,3 @@ if __name__ == "__main__":
     print("\n==============================")
     print("ALL 6 TESTS PASSED SUCCESSFULLY!")
     print("==============================")
-

@@ -59,6 +59,7 @@ class AgentReply(BaseModel):
     rag_sources: List[RAGSourceItem] = []
     tool_calls: List[ToolCallEvent] = []
     thoughts: Optional[str] = None
+    qdrant_indexed: bool = True
 
 # ----------------- Memory -----------------
 

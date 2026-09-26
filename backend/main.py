@@ -2,9 +2,11 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from backend.config import config
 from backend.database import init_db
 from backend.rag.vector_store import QdrantVectorStore
-from backend.routers import conversations, messages, memory, rag, config_route
+from backend.routers import conversations, messages, memory, rag, config_route, auth
 
 # Configure root logger
 logging.basicConfig(
@@ -23,18 +25,6 @@ async def lifespan(app: FastAPI):
     QdrantVectorStore.get_instance()
     logger.info("Qdrant Vector Store initialized.")
 
-    # Pre-warm BM25, Gemini embeddings and reranker models in background thread
-    import threading
-    def warmup_models():
-        try:
-            from backend.rag.embeddings import GeminiEmbeddingService, BGERerankerService
-            GeminiEmbeddingService.get_instance().warmup()
-            BGERerankerService.get_instance().warmup()
-            logger.info("Gemini dense, BM25 sparse, and BGE reranker models are warmed up.")
-        except Exception as e:
-            logger.warning(f"Model warmup notice: {e}")
-
-    threading.Thread(target=warmup_models, daemon=True).start()
     yield
     logger.info("Shutting down AI Assistant backend services...")
 
@@ -45,10 +35,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+if not config.SESSION_SECRET or len(config.SESSION_SECRET) < 32 or config.SESSION_SECRET.startswith("replace_with"):
+    raise RuntimeError("Set a random SESSION_SECRET of at least 32 characters in .env")
+app.add_middleware(SessionMiddleware, secret_key=config.SESSION_SECRET, same_site="lax", https_only=config.SESSION_HTTPS_ONLY)
+
 # CORS middleware for local frontend development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[config.FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,6 +54,7 @@ app.include_router(messages.router)
 app.include_router(memory.router)
 app.include_router(rag.router)
 app.include_router(config_route.router)
+app.include_router(auth.router)
 
 @app.get("/api/health")
 def health_check():

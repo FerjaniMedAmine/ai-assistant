@@ -4,23 +4,37 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from backend.database import get_db
-from backend.models import Conversation, Message
+from backend.models import Conversation, Message, User
+from backend.routers.auth import get_current_user
 from backend.schemas import MessageCreate, MessageEdit, AgentReply, MessageResponse
 from backend.agent.orchestrator import run_agent_orchestrator, stream_agent_orchestrator
+from backend.rag.vector_store import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["messages"])
+
+
+def remove_indexed_replies(assistant_ids: list[str]) -> None:
+    if not assistant_ids:
+        return
+    try:
+        store = QdrantVectorStore.get_instance()
+        for assistant_id in assistant_ids:
+            store.delete_exchange(assistant_id)
+    except Exception:
+        logger.exception("Failed to remove indexed chat replies from Qdrant")
 
 @router.post("/conversations/{conversation_id}/messages/stream")
 def send_message_stream(
     conversation_id: str,
     payload: MessageCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Stream tokens in real time via Server-Sent Events (SSE).
     """
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -41,7 +55,8 @@ def send_message_stream(
             rag_enabled=payload.rag_enabled,
             memory_enabled=payload.memory_enabled,
             thinking_level=payload.thinking_level,
-            linked_message_id=payload.linked_message_id
+            linked_message_id=payload.linked_message_id,
+            user_id=user.id,
         ),
         media_type="text/event-stream"
     )
@@ -50,14 +65,15 @@ def send_message_stream(
 def send_message(
     conversation_id: str,
     payload: MessageCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Post a user prompt to a conversation, rebuild context from database,
     orchestrate LLM deliberation and autonomous tool execution,
     and persist conversation messages.
     """
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -77,7 +93,8 @@ def send_message(
         rag_enabled=payload.rag_enabled,
         memory_enabled=payload.memory_enabled,
         thinking_level=payload.thinking_level,
-        linked_message_id=payload.linked_message_id
+        linked_message_id=payload.linked_message_id,
+        user_id=user.id,
     )
 
     return reply_data
@@ -86,7 +103,8 @@ def send_message(
 def edit_message(
     message_id: str,
     payload: MessageEdit,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Edit a message's content in the database:
@@ -95,7 +113,7 @@ def edit_message(
     3. Treat the edited message as the new end of the conversation.
     4. Re-run LLM orchestration to generate the new AI response.
     """
-    target_msg = db.query(Message).filter(Message.id == message_id).first()
+    target_msg = db.query(Message).join(Conversation).filter(Message.id == message_id, Conversation.user_id == user.id).first()
     if not target_msg:
         raise HTTPException(status_code=404, detail="Message not found")
 
@@ -103,6 +121,15 @@ def edit_message(
     msg_created_at = target_msg.created_at
 
     # Hard-delete all subsequent messages in this conversation
+    subsequent_messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conv_id, Message.created_at > msg_created_at)
+        .all()
+    )
+    assistant_ids = [msg.id for msg in subsequent_messages if msg.role == "assistant"]
+    if target_msg.role == "assistant":
+        assistant_ids.append(target_msg.id)
+    remove_indexed_replies(assistant_ids)
     subsequent_deleted = (
         db.query(Message)
         .filter(Message.conversation_id == conv_id, Message.created_at > msg_created_at)
@@ -135,12 +162,22 @@ def edit_message(
             rag_enabled=rag_enabled,
             memory_enabled=memory_enabled,
             thinking_level=thinking_level,
-            linked_message_id=linked_id
+            linked_message_id=linked_id,
+            user_id=user.id,
         )
         return reply_data
 
     else:
         # If an assistant message was edited directly
+        prior_user = (
+            db.query(Message)
+            .filter(Message.conversation_id == conv_id, Message.role == "user", Message.created_at < msg_created_at)
+            .order_by(Message.created_at.desc())
+            .first()
+        )
+        if prior_user:
+            from backend.agent.orchestrator import index_exchange
+            index_exchange(user.id, prior_user, target_msg)
         return {
             "user_message": target_msg,
             "assistant_message": target_msg,
@@ -150,14 +187,25 @@ def edit_message(
         }
 
 @router.delete("/messages/{message_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_message(message_id: str, db: Session = Depends(get_db)):
+def delete_message(message_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     Hard delete an individual message permanently from PostgreSQL.
     """
-    target_msg = db.query(Message).filter(Message.id == message_id).first()
+    target_msg = db.query(Message).join(Conversation).filter(Message.id == message_id, Conversation.user_id == user.id).first()
     if not target_msg:
         raise HTTPException(status_code=404, detail="Message not found")
 
+    assistant_ids = [target_msg.id] if target_msg.role == "assistant" else []
+    if target_msg.role == "user":
+        next_assistant = (
+            db.query(Message)
+            .filter(Message.conversation_id == target_msg.conversation_id, Message.role == "assistant", Message.created_at > target_msg.created_at)
+            .order_by(Message.created_at)
+            .first()
+        )
+        if next_assistant:
+            assistant_ids.append(next_assistant.id)
+    remove_indexed_replies(assistant_ids)
     db.delete(target_msg)
     db.commit()
     return None

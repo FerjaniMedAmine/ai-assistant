@@ -7,6 +7,7 @@ engine = create_engine(
     config.DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
+    pool_recycle=300,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -28,4 +29,5 @@ def init_db():
     """
     Initialize all database tables.
     """
+    from backend import models  # noqa: F401 - register mapped tables
     Base.metadata.create_all(bind=engine)

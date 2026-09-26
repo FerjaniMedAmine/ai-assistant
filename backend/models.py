@@ -14,6 +14,7 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String(36), primary_key=True, default=generate_uuid, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     title = Column(String(255), nullable=False)
     mode = Column(String(20), nullable=False, default="linear")  # 'linear' or 'isolated'
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -56,5 +57,17 @@ class Memory(Base):
     __tablename__ = "memory"
 
     id = Column(String(36), primary_key=True, default=generate_uuid, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    google_sub = Column(String(255), unique=True, nullable=False, index=True)
+    email = Column(String(320), nullable=False)
+    name = Column(String(255), nullable=False)
+    picture = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)

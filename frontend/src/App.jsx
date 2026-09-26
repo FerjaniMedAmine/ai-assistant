@@ -14,6 +14,10 @@ import {
   getDocumentStats,
   ingestDocument,
   clearDocuments,
+  listDocuments,
+  deleteDocumentSource,
+  getCurrentUser,
+  signOut,
 } from './api/client';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import Sidebar from './components/Sidebar';
@@ -38,6 +42,9 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [memories, setMemories] = useState([]);
   const [docStats, setDocStats] = useState({ total_points: 0 });
+  const [documents, setDocuments] = useState([]);
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
 
@@ -66,14 +73,16 @@ export default function App() {
   // Load initial data
   const loadInitialData = async () => {
     try {
-      const [convs, mems, stats] = await Promise.all([
+      const [convs, mems, stats, docs] = await Promise.all([
         getConversations(),
         getMemories(),
         getDocumentStats(),
+        listDocuments(),
       ]);
       setConversations(convs);
       setMemories(mems);
       setDocStats(stats);
+      setDocuments(docs);
 
       // Select active conversation if it exists in conversations with messages
       if (activeConvId && convs.some((c) => c.id === activeConvId)) {
@@ -105,7 +114,21 @@ export default function App() {
   };
 
   useEffect(() => {
-    loadInitialData();
+    getCurrentUser()
+      .then((currentUser) => {
+        setUser(currentUser);
+        if (currentUser) {
+          const previousUser = window.localStorage.getItem('ai_user_id');
+          if (previousUser && previousUser !== currentUser.id) {
+            setActiveConvId(null);
+            setDrafts({});
+          }
+          window.localStorage.setItem('ai_user_id', currentUser.id);
+          loadInitialData();
+        }
+      })
+      .catch((error) => setErrorMsg(error.message))
+      .finally(() => setAuthLoading(false));
   }, []);
 
   const handleSelectConversation = (id) => {
@@ -232,6 +255,9 @@ export default function App() {
             setLatestToolCalls((prev) => [...prev, tc]);
           },
           onDone: async (reply) => {
+            if (reply.qdrant_indexed === false) {
+              setErrorMsg('Reply saved to the database, but indexing it in Qdrant failed. Please try again later.');
+            }
             // Replace temporary messages with finalized database records
             setMessages((prev) =>
               prev.map((m) => {
@@ -261,9 +287,10 @@ export default function App() {
           },
           onError: (err) => {
             setErrorMsg(`Failed to stream message: ${err.message}`);
-            // Remove empty assistant placeholder if failed completely
             setMessages((prev) =>
-              prev.filter((m) => !(m.id === tempAsstId && !m.content))
+              prev
+                .filter((m) => !(m.id === tempAsstId && !m.content))
+                .map((m) => m.id === tempAsstId ? { ...m, isStreaming: false } : m)
             );
             setLoading(false);
           },
@@ -319,16 +346,38 @@ export default function App() {
 
   const handleIngestDocument = async (formData) => {
     const res = await ingestDocument(formData);
-    const stats = await getDocumentStats();
+    const [stats, docs] = await Promise.all([getDocumentStats(), listDocuments()]);
     setDocStats(stats);
+    setDocuments(docs);
     return res;
   };
 
   const handleClearAllDocuments = async () => {
     await clearDocuments();
-    const stats = await getDocumentStats();
+    const [stats, docs] = await Promise.all([getDocumentStats(), listDocuments()]);
     setDocStats(stats);
+    setDocuments(docs);
   };
+
+  const handleDeleteDocument = async (source) => {
+    await deleteDocumentSource(source);
+    const [stats, docs] = await Promise.all([getDocumentStats(), listDocuments()]);
+    setDocStats(stats);
+    setDocuments(docs);
+  };
+
+  if (authLoading) return <div className="auth-screen">Loading account…</div>;
+  if (!user) return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <span className="auth-eyebrow">AI ASSISTANT</span>
+        <h1>Your workspace</h1>
+        <p>Sign in to access your conversations, memory, and knowledge base.</p>
+        {errorMsg && <p className="auth-error">{errorMsg}</p>}
+        <a className="auth-button" href="/api/auth/login">Continue with Google</a>
+      </div>
+    </div>
+  );
 
   const isIsolatedMode = activeConv?.mode === 'isolated';
 
@@ -348,6 +397,13 @@ export default function App() {
         onOpenKnowledgeModal={() => setIsKnowledgeOpen(true)}
         memoryCount={memories.length}
         ragPointsCount={docStats.total_points ?? 0}
+        documentCount={documents.length}
+        user={user}
+        onSignOut={async () => {
+          await signOut();
+          Object.keys(window.localStorage).filter((key) => key.startsWith('ai_')).forEach((key) => window.localStorage.removeItem(key));
+          window.location.reload();
+        }}
       />
 
       {/* Main Chat Workspace */}
@@ -434,8 +490,10 @@ export default function App() {
         isOpen={isKnowledgeOpen}
         onClose={() => setIsKnowledgeOpen(false)}
         stats={docStats}
+        documents={documents}
         onIngest={handleIngestDocument}
         onClearAll={handleClearAllDocuments}
+        onDeleteDocument={handleDeleteDocument}
       />
     </div>
   );

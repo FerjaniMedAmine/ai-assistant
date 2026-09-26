@@ -20,13 +20,14 @@ def retrieve_and_rerank(
     """
     if not query.strip():
         return []
+    if not user_id:
+        raise ValueError("user_id is required for RAG retrieval")
 
     effective_top_k = top_k or config.TOP_K
     effective_top_n = top_n or config.TOP_N
 
     embedder = GeminiEmbeddingService.get_instance()
     vector_store = QdrantVectorStore.get_instance()
-    reranker = BGERerankerService.get_instance()
 
     # Step 1: Hybrid encoding of query (dense 3072 + BM25 sparse)
     dense_q, sparse_q = embedder.encode_query(query)
@@ -44,6 +45,7 @@ def retrieve_and_rerank(
         return []
 
     # Step 3: Rerank candidates with BGE-Reranker-v2-M3
+    reranker = BGERerankerService.get_instance()
     pairs = [[query, c["content"]] for c in candidates]
     rerank_scores = reranker.compute_scores(pairs)
 

@@ -81,14 +81,13 @@ def ingest_text(
     logger.info(f"Successfully indexed {count} chunks for '{source_name}'.")
     return count
 
-def ingest_file(file_path: Path, user_id: str = "default_user") -> int:
+def ingest_file(file_path: Path, user_id: str = "default_user", source_name: Optional[str] = None) -> int:
     """
     Reads a file from disk and ingests it.
     """
     text = extract_text_from_file(file_path)
     return ingest_text(
         text,
-        source_name=file_path.name,
-        metadata={"file_path": str(file_path)},
+        source_name=source_name or file_path.name,
         user_id=user_id
     )

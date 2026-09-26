@@ -107,14 +107,32 @@ class BGERerankerService:
 
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.use_fp16 = torch.cuda.is_available()
-        logger.info(f"Loading BGE-Reranker model ({config.RERANKER_MODEL_NAME}) on {self.device}...")
+        self.quantized = False
+        if config.RERANKER_4BIT:
+            try:
+                from transformers import AutoModelForSequenceClassification, AutoTokenizer, BitsAndBytesConfig
+                self.tokenizer = AutoTokenizer.from_pretrained(config.RERANKER_MODEL_NAME)
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    config.RERANKER_MODEL_NAME,
+                    quantization_config=BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=torch.float32 if self.device == "cpu" else torch.float16,
+                    ),
+                    device_map={"": self.device},
+                )
+                self.model.eval()
+                self.quantized = True
+                logger.info("Loaded 4 bit BGE reranker on %s", self.device)
+                return
+            except Exception as error:
+                logger.warning("4 bit reranker unavailable on %s: %s. Using full precision.", self.device, error)
         self.reranker = FlagReranker(
             config.RERANKER_MODEL_NAME,
-            use_fp16=self.use_fp16,
-            device=self.device
+            use_fp16=self.device == "cuda",
+            device=self.device,
         )
-        logger.info("BGE-Reranker model loaded successfully on GPU.")
+        logger.info("Loaded full precision BGE reranker on %s", self.device)
 
     @classmethod
     def get_instance(cls) -> "BGERerankerService":
@@ -128,6 +146,20 @@ class BGERerankerService:
         """
         if not pairs:
             return []
+        if self.quantized:
+            scores = []
+            with torch.inference_mode():
+                for start in range(0, len(pairs), 8):
+                    batch = self.tokenizer(
+                        pairs[start:start + 8],
+                        padding=True,
+                        truncation=True,
+                        max_length=384,
+                        return_tensors="pt",
+                    )
+                    batch = {key: value.to(self.device) for key, value in batch.items()}
+                    scores.extend(self.model(**batch).logits.reshape(-1).float().cpu().tolist())
+            return scores
         with torch.inference_mode():
             scores = self.reranker.compute_score(pairs, max_length=384)
         if isinstance(scores, (float, int)):

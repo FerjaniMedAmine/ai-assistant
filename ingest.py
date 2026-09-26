@@ -22,7 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest documents into Qdrant Hybrid Vector Store (gemini-embedding-2 + BM25)")
     parser.add_argument("--file", type=str, help="Path to a single document file to ingest")
     parser.add_argument("--path", type=str, help="Path to a directory containing documents to ingest")
-    parser.add_argument("--user-id", type=str, default="default_user", help="User ID for multi-user isolation")
+    parser.add_argument("--user-id", type=str, required=True, help="Your signed-in user ID from /api/auth/me")
     args = parser.parse_args()
 
     if not args.file and not args.path:
@@ -33,7 +33,7 @@ def main():
     print(f"============================================================")
     print(f"Document Ingestion Utility")
     print(f"Collection:     {config.QDRANT_COLLECTION_NAME}")
-    print(f"Embedding:      {config.EMBEDDING_MODEL_NAME} (3072-dim) + BM25")
+    print(f"Embedding:      {config.EMBEDDING_MODEL_NAME} ({config.EMBEDDING_DIMENSION}-dim) + BM25")
     print(f"User ID:        {args.user_id}")
     print(f"Chunk Size:     {config.CHUNK_SIZE}")
     print(f"Chunk Overlap:  {config.CHUNK_OVERLAP}")
@@ -67,7 +67,7 @@ def main():
             total_chunks += chunks
             print(f"  -> {chunks} chunks")
 
-    stats = QdrantVectorStore.get_instance().get_stats()
+    stats = QdrantVectorStore.get_instance().get_stats(args.user_id)
     print(f"\nIngestion Complete!")
     print(f"Total chunks indexed this run: {total_chunks}")
     print(f"Total points now in Qdrant collection: {stats['total_points']}")

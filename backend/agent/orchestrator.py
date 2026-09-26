@@ -10,8 +10,27 @@ from backend.config import config
 from backend.models import Conversation, Message, Memory
 from backend.rag.retrieval import retrieve_and_rerank
 from backend.agent.tools import build_agent_tools
+from backend.agent.context import build_history_context, compact_text
+from backend.rag.vector_store import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
+
+
+def index_exchange(user_id: str, user_message: Message, assistant_message: Message) -> bool:
+    """Keep chat history searchable in Qdrant even when retrieval is switched off."""
+    try:
+        QdrantVectorStore.get_instance().upsert_exchange(
+            user_id=user_id,
+            conversation_id=user_message.conversation_id,
+            user_message_id=user_message.id,
+            assistant_message_id=assistant_message.id,
+            user_text=user_message.content,
+            assistant_text=assistant_message.content,
+        )
+        return True
+    except Exception:
+        logger.exception("Failed to index exchange %s in Qdrant", assistant_message.id)
+        return False
 
 SYSTEM_PROMPT_TEMPLATE = """You are an advanced, intelligent AI Assistant with access to autonomous tools, long-term memory, and retrieved knowledge context.
 
@@ -20,7 +39,9 @@ Key Guidelines:
 2. When the user asks you to forget or delete facts from long-term memory, call the `remove_from_memory` tool.
 3. When the user asks you to clear, reset, or delete the current conversation history, call the `clear_conversation_history` tool.
 4. When answering questions requiring up-to-date real-world facts, current news, or live data, call the `tavily_search` tool.
-5. Be concise, precise, and polite. If knowledge context or memory is provided below, utilize it faithfully.
+5. Use the workspace tools when asked to manage files or folders. All paths are relative to the signed-in user's private workspace.
+6. Older and large chat messages may be omitted or shortened. Use `search_history` to find older message IDs and `recall_message` to retrieve only the range needed. Never guess omitted content.
+7. Be concise, precise, and polite. If knowledge context or memory is provided below, utilize it faithfully.
 """
 
 def extract_thinking_and_content(ai_msg: AIMessage) -> Tuple[str, Optional[str]]:
@@ -125,7 +146,8 @@ def run_agent_orchestrator(
     rag_enabled: bool,
     memory_enabled: bool,
     thinking_level: str,
-    linked_message_id: Optional[str] = None
+    linked_message_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Core agent orchestration function:
@@ -136,7 +158,7 @@ def run_agent_orchestrator(
     5. Dispatches autonomous tools (memory, history clear, Tavily search).
     6. Persists user message and assistant reply to database.
     """
-    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    conversation = db.query(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id).first()
     if not conversation:
         raise ValueError(f"Conversation {conversation_id} not found.")
 
@@ -174,12 +196,14 @@ def run_agent_orchestrator(
         db.add(asst_record)
         db.commit()
         db.refresh(asst_record)
+        qdrant_indexed = index_exchange(user_id, user_msg_record, asst_record)
         return {
             "user_message": user_msg_record,
             "assistant_message": asst_record,
             "rag_sources": [],
             "tool_calls": [],
-            "thoughts": None
+            "thoughts": None,
+            "qdrant_indexed": qdrant_indexed,
         }
 
     # 3. Build System Prompt components
@@ -187,7 +211,7 @@ def run_agent_orchestrator(
 
     # Persistent Memory Injection
     if memory_enabled:
-        memories = db.query(Memory).order_by(Memory.created_at).all()
+        memories = db.query(Memory).filter(Memory.user_id == user_id).order_by(Memory.created_at).all()
         if memories:
             mem_lines = "\n".join([f"- {m.content}" for m in memories])
             system_sections.append(
@@ -199,16 +223,16 @@ def run_agent_orchestrator(
     # RAG Retrieval & Injection
     rag_sources = []
     if rag_enabled:
-        rag_sources = retrieve_and_rerank(user_prompt, top_k=config.TOP_K, top_n=config.TOP_N)
+        rag_sources = retrieve_and_rerank(user_prompt, top_k=config.TOP_K, top_n=config.TOP_N, user_id=user_id)
         if rag_sources:
             context_blocks = []
             for i, src in enumerate(rag_sources, 1):
                 context_blocks.append(
-                    f"[Document Snippet {i} | Source: {src.get('source', 'Unknown')} | Score: {src.get('score', 0):.2f}]\n{src['content']}"
+                    f"[Knowledge Snippet {i} | Source: {src.get('source', 'Unknown')} | Score: {src.get('score', 0):.2f}]\n{src['content']}"
                 )
             joined_context = "\n\n".join(context_blocks)
             system_sections.append(
-                f"## Retrieved Document Knowledge Context:\nUse the following verified context passages to answer:\n{joined_context}"
+                f"## Retrieved Knowledge Context:\nUse the following context passages to answer:\n{joined_context}"
             )
 
     system_message = SystemMessage(content="\n\n".join(system_sections))
@@ -224,11 +248,7 @@ def run_agent_orchestrator(
             .order_by(Message.created_at)
             .all()
         )
-        for rec in prior_records:
-            if rec.role == "user":
-                messages_to_send.append(HumanMessage(content=rec.content))
-            elif rec.role == "assistant":
-                messages_to_send.append(AIMessage(content=rec.content))
+        messages_to_send.extend(build_history_context(prior_records))
 
         # Add the current user prompt
         messages_to_send.append(HumanMessage(content=user_prompt))
@@ -237,7 +257,7 @@ def run_agent_orchestrator(
         # Isolated mode: NO automatic history
         # If user explicitly linked a prior message exchange (hk, ak):
         if linked_message_id:
-            linked_user = db.query(Message).filter(Message.id == linked_message_id).first()
+            linked_user = db.query(Message).filter(Message.id == linked_message_id, Message.conversation_id == conversation_id).first()
             if linked_user:
                 # Find the assistant response that followed that user message
                 linked_asst = (
@@ -250,9 +270,9 @@ def run_agent_orchestrator(
                     .order_by(Message.created_at)
                     .first()
                 )
-                linked_context_text = f"Linked Prior Question: {linked_user.content}"
+                linked_context_text = f"Linked Prior Question: {compact_text(linked_user)}"
                 if linked_asst:
-                    linked_context_text += f"\nLinked Prior Answer: {linked_asst.content}"
+                    linked_context_text += f"\nLinked Prior Answer: {compact_text(linked_asst)}"
 
                 messages_to_send.append(
                     SystemMessage(content=f"## Explicitly Linked Prior Exchange:\n{linked_context_text}")
@@ -263,7 +283,7 @@ def run_agent_orchestrator(
 
     # 5. Bind agent tools & execute agent loop
     tool_events: List[Dict[str, Any]] = []
-    tools = build_agent_tools(db, conversation_id, tool_events)
+    tools = build_agent_tools(db, conversation_id, tool_events, user_id)
     tools_by_name = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
 
@@ -330,13 +350,17 @@ def run_agent_orchestrator(
     db.add(asst_record)
     db.commit()
     db.refresh(asst_record)
+    qdrant_indexed = True
+    if not any(event.get("tool") == "clear_conversation_history" for event in tool_events):
+        qdrant_indexed = index_exchange(user_id, user_msg_record, asst_record)
 
     return {
         "user_message": user_msg_record,
         "assistant_message": asst_record,
         "rag_sources": rag_sources,
         "tool_calls": tool_events,
-        "thoughts": final_thoughts
+        "thoughts": final_thoughts,
+        "qdrant_indexed": qdrant_indexed,
     }
 
 async def stream_agent_orchestrator(
@@ -346,7 +370,8 @@ async def stream_agent_orchestrator(
     rag_enabled: bool,
     memory_enabled: bool,
     thinking_level: str,
-    linked_message_id: Optional[str] = None
+    linked_message_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ):
     """
     Streaming agent orchestration yielding Server-Sent Events (SSE):
@@ -355,7 +380,7 @@ async def stream_agent_orchestrator(
     - data: {"type": "done", "user_message": {...}, "assistant_message": {...}, ...}
     - data: {"type": "error", "error": "..."}
     """
-    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    conversation = db.query(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id).first()
     if not conversation:
         yield f"data: {json.dumps({'type': 'error', 'error': f'Conversation {conversation_id} not found.'})}\n\n"
         return
@@ -393,16 +418,17 @@ async def stream_agent_orchestrator(
         db.add(asst_record)
         db.commit()
         db.refresh(asst_record)
+        qdrant_indexed = index_exchange(user_id, user_msg_record, asst_record)
 
         yield f"data: {json.dumps({'type': 'token', 'token': fallback_msg})}\n\n"
-        yield f"data: {json.dumps({'type': 'done', 'user_message': {'id': user_msg_record.id, 'conversation_id': user_msg_record.conversation_id, 'role': 'user', 'content': user_prompt, 'created_at': user_msg_record.created_at.isoformat(), 'rag_enabled': rag_enabled, 'memory_enabled': memory_enabled, 'thinking_level': thinking_level, 'linked_message_id': linked_message_id}, 'assistant_message': {'id': asst_record.id, 'conversation_id': asst_record.conversation_id, 'role': 'assistant', 'content': fallback_msg, 'created_at': asst_record.created_at.isoformat(), 'rag_enabled': rag_enabled, 'memory_enabled': memory_enabled, 'thinking_level': thinking_level, 'linked_message_id': None}, 'rag_sources': [], 'tool_calls': []})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'user_message': {'id': user_msg_record.id, 'conversation_id': user_msg_record.conversation_id, 'role': 'user', 'content': user_prompt, 'created_at': user_msg_record.created_at.isoformat(), 'rag_enabled': rag_enabled, 'memory_enabled': memory_enabled, 'thinking_level': thinking_level, 'linked_message_id': linked_message_id}, 'assistant_message': {'id': asst_record.id, 'conversation_id': asst_record.conversation_id, 'role': 'assistant', 'content': fallback_msg, 'created_at': asst_record.created_at.isoformat(), 'rag_enabled': rag_enabled, 'memory_enabled': memory_enabled, 'thinking_level': thinking_level, 'linked_message_id': None}, 'rag_sources': [], 'tool_calls': [], 'qdrant_indexed': qdrant_indexed})}\n\n"
         return
 
     # 3. Build System Prompt components
     system_sections = [SYSTEM_PROMPT_TEMPLATE]
 
     if memory_enabled:
-        memories = db.query(Memory).order_by(Memory.created_at).all()
+        memories = db.query(Memory).filter(Memory.user_id == user_id).order_by(Memory.created_at).all()
         if memories:
             mem_lines = "\n".join([f"- {m.content}" for m in memories])
             system_sections.append(f"## Persistent User Memory:\nThe following facts are remembered about the user across conversations:\n{mem_lines}")
@@ -411,15 +437,15 @@ async def stream_agent_orchestrator(
 
     rag_sources = []
     if rag_enabled:
-        rag_sources = retrieve_and_rerank(user_prompt, top_k=config.TOP_K, top_n=config.TOP_N)
+        rag_sources = retrieve_and_rerank(user_prompt, top_k=config.TOP_K, top_n=config.TOP_N, user_id=user_id)
         if rag_sources:
             context_blocks = []
             for i, src in enumerate(rag_sources, 1):
                 context_blocks.append(
-                    f"[Document Snippet {i} | Source: {src.get('source', 'Unknown')} | Score: {src.get('score', 0):.2f}]\n{src['content']}"
+                    f"[Knowledge Snippet {i} | Source: {src.get('source', 'Unknown')} | Score: {src.get('score', 0):.2f}]\n{src['content']}"
                 )
             joined_context = "\n\n".join(context_blocks)
-            system_sections.append(f"## Retrieved Document Knowledge Context:\nUse the following verified context passages to answer:\n{joined_context}")
+            system_sections.append(f"## Retrieved Knowledge Context:\nUse the following context passages to answer:\n{joined_context}")
 
     system_message = SystemMessage(content="\n\n".join(system_sections))
 
@@ -432,15 +458,11 @@ async def stream_agent_orchestrator(
             .order_by(Message.created_at)
             .all()
         )
-        for rec in prior_records:
-            if rec.role == "user":
-                messages_to_send.append(HumanMessage(content=rec.content))
-            elif rec.role == "assistant":
-                messages_to_send.append(AIMessage(content=rec.content))
+        messages_to_send.extend(build_history_context(prior_records))
         messages_to_send.append(HumanMessage(content=user_prompt))
     else:
         if linked_message_id:
-            linked_user = db.query(Message).filter(Message.id == linked_message_id).first()
+            linked_user = db.query(Message).filter(Message.id == linked_message_id, Message.conversation_id == conversation_id).first()
             if linked_user:
                 linked_asst = (
                     db.query(Message)
@@ -452,42 +474,44 @@ async def stream_agent_orchestrator(
                     .order_by(Message.created_at)
                     .first()
                 )
-                linked_context_text = f"Linked Prior Question: {linked_user.content}"
+                linked_context_text = f"Linked Prior Question: {compact_text(linked_user)}"
                 if linked_asst:
-                    linked_context_text += f"\nLinked Prior Answer: {linked_asst.content}"
+                    linked_context_text += f"\nLinked Prior Answer: {compact_text(linked_asst)}"
                 messages_to_send.append(SystemMessage(content=f"## Explicitly Linked Prior Exchange:\n{linked_context_text}"))
         messages_to_send.append(HumanMessage(content=user_prompt))
 
     # 5. Bind agent tools & execute stream loop
     tool_events: List[Dict[str, Any]] = []
-    tools = build_agent_tools(db, conversation_id, tool_events)
+    tools = build_agent_tools(db, conversation_id, tool_events, user_id)
     tools_by_name = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
 
     current_messages = list(messages_to_send)
     final_content_parts = []
+    streamed_text_parts = []
+    generation_error = None
 
     for step in range(5):
-        tool_calls_detected = []
+        response_chunk = None
         step_tokens = []
 
         try:
             for chunk in llm_with_tools.stream(current_messages):
-                if hasattr(chunk, "tool_calls") and chunk.tool_calls:
-                    tool_calls_detected.extend(chunk.tool_calls)
+                response_chunk = chunk if response_chunk is None else response_chunk + chunk
 
                 token = extract_token_from_chunk(chunk)
                 if token:
                     step_tokens.append(token)
+                    streamed_text_parts.append(token)
                     yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
                 await asyncio.sleep(0)
         except Exception as e:
-            logger.error(f"Error streaming response chunk: {e}")
-            err_msg = f"\n[Error generating response: {str(e)}]"
-            yield f"data: {json.dumps({'type': 'token', 'token': err_msg})}\n\n"
-            step_tokens.append(err_msg)
+            logger.exception("Error streaming response chunk")
+            generation_error = str(e)
             break
 
+        # Tool calls arrive in fragments during streaming; combine chunks before reading them.
+        tool_calls_detected = response_chunk.tool_calls if response_chunk else []
         if tool_calls_detected:
             # Append AIMessage with tool calls
             current_messages.append(AIMessage(content="".join(step_tokens), tool_calls=tool_calls_detected))
@@ -504,19 +528,40 @@ async def stream_agent_orchestrator(
                 else:
                     t_output = f"Unknown tool: {t_name}"
 
-                tool_events.append({"tool": t_name, "args": t_args, "result": str(t_output)})
                 yield f"data: {json.dumps({'type': 'tool_call', 'tool': t_name, 'args': t_args, 'result': str(t_output)})}\n\n"
                 current_messages.append(ToolMessage(content=str(t_output), tool_call_id=t_id, name=t_name))
         else:
-            final_content_parts.extend(step_tokens)
+            # The merged chunk may contain text even if individual chunks were empty.
+            final_content_parts.append("".join(step_tokens) or extract_token_from_chunk(response_chunk))
             break
     else:
         if not final_content_parts and step_tokens:
             final_content_parts.extend(step_tokens)
 
+    if generation_error:
+        yield f"data: {json.dumps({'type': 'error', 'error': f'Error generating response: {generation_error}'})}\n\n"
+        return
+
     final_content = "".join(final_content_parts).strip()
     if not final_content:
-        final_content = "Response completed."
+        final_content = "".join(streamed_text_parts).strip()
+    if not final_content:
+        # Some tool-enabled Gemini streams end with an empty text chunk. Ask once
+        # for a plain final answer based on the tool results before reporting failure.
+        try:
+            completion = llm_with_tools.invoke(current_messages)
+            final_content = extract_thinking_and_content(completion)[0].strip()
+        except Exception:
+            logger.exception("Failed to recover empty streamed response")
+    if not final_content:
+        yield f"data: {json.dumps({'type': 'error', 'error': 'The model returned no answer. Please retry.'})}\n\n"
+        return
+
+    if not streamed_text_parts or "".join(streamed_text_parts).strip() != final_content:
+        # The completion event carries the authoritative saved text; send it as a
+        # token too so clients without replacement logic display the same answer.
+        if not streamed_text_parts:
+            yield f"data: {json.dumps({'type': 'token', 'token': final_content})}\n\n"
 
     # 6. Save assistant reply to PostgreSQL
     asst_record = Message(
@@ -530,6 +575,9 @@ async def stream_agent_orchestrator(
     db.add(asst_record)
     db.commit()
     db.refresh(asst_record)
+    qdrant_indexed = True
+    if not any(event.get("tool") == "clear_conversation_history" for event in tool_events):
+        qdrant_indexed = index_exchange(user_id, user_msg_record, asst_record)
 
     # 7. Yield completion event
     yield f"data: {json.dumps({
@@ -557,5 +605,6 @@ async def stream_agent_orchestrator(
             'linked_message_id': asst_record.linked_message_id
         },
         'rag_sources': rag_sources,
-        'tool_calls': tool_events
+        'tool_calls': tool_events,
+        'qdrant_indexed': qdrant_indexed
     })}\n\n"
